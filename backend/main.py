@@ -1,49 +1,66 @@
 
+import os
+import sqlite3
+import joblib
+import pandas as pd
+
+from pathlib import Path
+from datetime import datetime
+from typing import Literal
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Literal
-from pathlib import Path
-from datetime import datetime
-import pandas as pd
-import sqlite3
-import joblib
 
-# ==================================================
-# QUANTA - INDUSTRIAL MACHINE INTELLIGENCE SYSTEM
-# ==================================================
+
+# ==========================================
+# FASTAPI APPLICATION
+# ==========================================
 
 app = FastAPI(
-    title="QUANTA - Industrial Machine Intelligence System",
+    title="Intelligent Industrial Machine Failure Prediction System",
     description="AI-powered industrial machine failure prediction API",
     version="1.0.0"
 )
 
-# ==================================================
-# CORS CONFIGURATION - REACT FRONTEND CONNECTION
-# ==================================================
+
+# ==========================================
+# CORS CONFIGURATION
+# ==========================================
+
+origins = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174"
+]
+
+frontend_origin = os.getenv("FRONTEND_ORIGIN")
+
+if frontend_origin:
+    origins.extend(
+        origin.strip()
+        for origin in frontend_origin.split(",")
+        if origin.strip()
+    )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173"
-    ],
-    allow_credentials=True,
+    allow_origins=origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"]
 )
 
-# ==================================================
+
+# ==========================================
 # FILE PATHS
-# ==================================================
+# ==========================================
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 MODEL_PATH = BASE_DIR / "industrial_machine_model.joblib"
-DB_PATH = BASE_DIR / "machine_history.db"
+DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "machine_history.db")))
 
 FEATURES = [
     "Type",
@@ -57,12 +74,45 @@ FEATURES = [
 model = None
 
 
-# ==================================================
-# LOAD TRAINED ML MODEL
-# ==================================================
+# ==========================================
+# DATABASE INITIALIZATION
+# ==========================================
+
+def initialize_database():
+
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                machine_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                machine_type TEXT NOT NULL,
+                air_temperature REAL,
+                process_temperature REAL,
+                rotational_speed REAL,
+                torque REAL,
+                tool_wear REAL,
+                prediction INTEGER,
+                failure_probability REAL
+            )
+        """)
+
+        conn.commit()
+
+
+def get_connection():
+    return sqlite3.connect(DB_PATH, timeout=30)
+
+
+# ==========================================
+# STARTUP
+# ==========================================
 
 @app.on_event("startup")
-def load_ml_model():
+def startup():
+
     global model
 
     if not MODEL_PATH.exists():
@@ -70,20 +120,15 @@ def load_ml_model():
 
     model = joblib.load(MODEL_PATH)
 
-
-# ==================================================
-# DATABASE CONNECTION
-# ==================================================
-
-def get_connection():
-    return sqlite3.connect(DB_PATH)
+    initialize_database()
 
 
-# ==================================================
-# INPUT DATA VALIDATION
-# ==================================================
+# ==========================================
+# INPUT VALIDATION
+# ==========================================
 
 class MachineInput(BaseModel):
+
     machine_id: str = Field(min_length=1, max_length=100)
 
     machine_type: Literal["L", "M", "H"]
@@ -95,35 +140,37 @@ class MachineInput(BaseModel):
     tool_wear: float
 
 
-# ==================================================
+# ==========================================
 # HOME ROUTE
-# ==================================================
+# ==========================================
 
 @app.get("/")
 def home():
+
     return {
-        "message": "QUANTA Backend is running!",
+        "message": "Industrial Machine Failure Prediction API",
         "status": "Online"
     }
 
 
-# ==================================================
+# ==========================================
 # MODEL STATUS
-# ==================================================
+# ==========================================
 
 @app.get("/model-status")
 def model_status():
+
     return {
         "model_loaded": model is not None,
-        "model_type": type(model).__name__ if model else None,
-        "features": list(model.feature_names_in_) if model else [],
-        "classes": model.classes_.tolist() if model else []
+        "model_type": type(model).__name__ if model is not None else None,
+        "features": list(model.feature_names_in_) if model is not None else [],
+        "classes": model.classes_.tolist() if model is not None else []
     }
 
 
-# ==================================================
+# ==========================================
 # MACHINE FAILURE PREDICTION
-# ==================================================
+# ==========================================
 
 @app.post("/predict")
 def predict_machine(data: MachineInput):
@@ -145,19 +192,32 @@ def predict_machine(data: MachineInput):
 
     input_df = pd.DataFrame([values], columns=FEATURES)
 
-    prediction = int(model.predict(input_df)[0])
+    try:
+        prediction = int(model.predict(input_df)[0])
 
-    probabilities = model.predict_proba(input_df)[0]
-    failure_index = list(model.classes_).index(1)
+        probabilities = model.predict_proba(input_df)[0]
+        classes = list(model.classes_)
 
-    failure_probability = float(probabilities[failure_index])
+        if 1 not in classes:
+            raise ValueError("Failure class not found in model.")
+
+        failure_index = classes.index(1)
+        failure_probability = float(probabilities[failure_index])
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Prediction failed: {error}"
+        )
 
     status = "Failure" if prediction == 1 else "Normal"
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     try:
+
         with get_connection() as conn:
+
             conn.execute("""
                 INSERT INTO predictions (
                     machine_id,
@@ -185,9 +245,8 @@ def predict_machine(data: MachineInput):
                 failure_probability
             ))
 
-            conn.commit()
-
     except sqlite3.Error as error:
+
         raise HTTPException(
             status_code=500,
             detail=f"Database error: {error}"
@@ -206,9 +265,9 @@ def predict_machine(data: MachineInput):
     }
 
 
-# ==================================================
-# FETCH MACHINE PREDICTION HISTORY
-# ==================================================
+# ==========================================
+# MACHINE PREDICTION HISTORY
+# ==========================================
 
 @app.get("/history")
 def get_prediction_history(limit: int = 100):
@@ -220,6 +279,7 @@ def get_prediction_history(limit: int = 100):
         )
 
     try:
+
         with get_connection() as conn:
 
             cursor = conn.execute("""
@@ -256,6 +316,7 @@ def get_prediction_history(limit: int = 100):
         }
 
     except sqlite3.Error as error:
+
         raise HTTPException(
             status_code=500,
             detail=f"Database error: {error}"
